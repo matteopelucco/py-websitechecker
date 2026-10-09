@@ -1,0 +1,3 @@
+httpx>=0.28
+PyYAML>=6.0
+playwright>=1.63  # solo per browser: true; poi: playwright install chromium

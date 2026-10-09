@@ -1,0 +1,40 @@
+# Configurazione di default di sitechecker.
+# Per uso personale copia questo file in .config.local.yaml (ignorato da git) e lancia:
+#   python sitechecker.py -c .config.local.yaml
+# Le chiavi omesse assumono il valore di default indicato qui.
+
+# Siti da controllare (lo schema https:// e' opzionale)
+urls:
+  - https://www.matteopelucco.com
+
+# Opzionale: file con un URL per riga (# per commenti), in aggiunta a `urls`
+urls_file: null
+
+# Check con browser reale (desktop + mobile, richiede: playwright install chromium)
+browser: false
+
+# Controlli HTTP
+links: 10             # link interni da campionare (0 = nessuno)
+max_resources: 40     # risorse (img/css/js) da verificare per pagina
+timeout: 15           # secondi
+slow_ms: 3000         # oltre questa soglia la pagina e' "lenta"
+tls_warn_days: 21     # avviso se il certificato scade entro N giorni
+insecure: false       # ignora errori TLS (sconsigliato)
+
+# Parallelismo
+concurrency: 10
+browser_concurrency: 3
+
+# Output
+shots: screenshots    # cartella degli screenshot (solo con browser: true)
+html: null            # es. report.html
+json: null            # es. report.json
+
+# Log
+verbose: 0            # 0 = silenzioso, 1 = passi principali, 2 = dettaglio
+log_file: null        # es. sitecheck.log (log completo, livello DEBUG)
+
+# Errori JS del browser da ignorare (espressioni regolari)
+ignore_js_errors:
+  - '^Failed to load resource'
+  - 'requestStorageAccess'

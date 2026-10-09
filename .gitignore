@@ -218,3 +218,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Configurazione locale (non versionata)
+.config.local.yaml
