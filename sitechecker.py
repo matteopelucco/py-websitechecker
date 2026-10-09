@@ -11,7 +11,8 @@ Livello 1 (default, veloce, solo HTTP):
 Livello 2 (browser: true, richiede Playwright):
   carica la pagina in un browser vero (desktop + mobile) e rileva errori JS in console,
   richieste fallite, risorse 4xx/5xx, immagini rotte, overflow orizzontale su mobile,
-  pagina visivamente vuota. Salva screenshot.
+  pagina visivamente vuota, stile non caricato, pagine non informative. Esplora anche alcune
+  pagine interne. Salva screenshot.
 
 Uso (tutte le opzioni stanno nel file di configurazione YAML, vedi config.yaml):
   python sitechecker.py                           # usa ./config.yaml
@@ -56,6 +57,9 @@ DEFAULTS = {
     "tls_warn_days": 21,
     "concurrency": 10,
     "browser_concurrency": 3,
+    "explore_pages": 3,       # pagine interne da visitare nel browser oltre alla prima (0 = solo la prima)
+    "explore_exclude": [r"logout|signout|esci\b", r"\.(pdf|zip|docx?|xlsx?|pptx?|jpe?g|png|gif|svg|mp[34])(\?|$)"],
+    "min_words": 40,          # sotto questa soglia la pagina e' "poco informativa" (WARN)
     "shots": "screenshots",
     "html": None,             # percorso del report HTML
     "json": None,             # percorso del report JSON
@@ -74,7 +78,7 @@ SOFT_ERRORS = [
     (r"OpenCms Setup Wizard|Alkacon OpenCms Setup", "FAIL", "setup wizard OpenCms esposto"),
     (r"^\s*Index of /", "FAIL", "directory listing"),
     (r"Internal Server Error|Application Error", "FAIL", "errore applicativo"),
-    (r"\b404\b.{0,40}(not found|non trovata)|page not found|pagina non trovata", "WARN", "la home sembra una 404"),
+    (r"\b404\b.{0,40}(not found|non trovata)|page not found|pagina non trovata", "WARN", "la pagina sembra una 404"),
     (r"lorem ipsum", "WARN", "testo placeholder (lorem ipsum)"),
     (r"<%|<jsp:|\$\{(param|requestScope|cms)\.", "WARN", "JSP/EL non interpretata"),
 ]
@@ -90,6 +94,7 @@ class Result:
     title: str = ""
     issues: list = field(default_factory=list)  # (sev, msg)
     screenshots: list = field(default_factory=list)
+    explored: list = field(default_factory=list)  # pagine interne visitate dal browser
 
     def add(self, sev, msg):
         log.debug("%s %s: %s", sev, self.url, msg)
@@ -263,6 +268,231 @@ async def check_http(client, url, args, sem):
     return res
 
 
+# titoli che indicano una pagina di errore / titoli generici privi di significato
+ERROR_TITLE = (r"\b(404|403|500|502|503)\b|not found|non trovata|access denied|accesso negato|forbidden"
+               r"|internal server error|service unavailable")
+GENERIC_TITLE = r"^\W*(untitled|home|document|new page|senza titolo|index)\W*$"
+
+# metriche raccolte nella pagina: l'interpretazione sta in review_metrics (testabile senza browser)
+PAGE_METRICS_JS = """() => {
+  const d = document, b = d.body, root = d.documentElement;
+  const vw = root.clientWidth, vh = window.innerHeight;
+  const text = (b.innerText || '').trim();
+  const lum = c => {
+    const m = c.match(/[\\d.]+/g); if (!m) return null;
+    const [r, g, bl] = m.slice(0, 3).map(v => { v = v / 255; return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); });
+    return 0.2126 * r + 0.7152 * g + 0.0722 * bl;
+  };
+  // sfondo effettivo; null se c'e' un'immagine di sfondo (contrasto non valutabile)
+  const bgOf = el => {
+    for (let e = el; e; e = e.parentElement) {
+      const s = getComputedStyle(e);
+      if (s.backgroundImage !== 'none') return null;
+      const m = s.backgroundColor.match(/[\\d.]+/g);
+      if (m && (m.length < 4 || parseFloat(m[3]) > 0.5)) return s.backgroundColor;
+    }
+    return 'rgb(255,255,255)';
+  };
+  const ratio = el => {
+    const bg = bgOf(el); if (!bg) return null;
+    const l1 = lum(getComputedStyle(el).color), l2 = lum(bg); if (l1 == null || l2 == null) return null;
+    return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05);
+  };
+  const low = [];
+  for (const sel of ['h1', 'p', 'a']) {
+    const el = d.querySelector(sel);
+    if (el && (el.innerText || '').trim()) { const r = ratio(el); if (r != null && r < 1.5) low.push(sel + ' ' + r.toFixed(2)); }
+  }
+  let overlay = 0;
+  for (let e = d.elementFromPoint(vw / 2, vh / 2); e && e !== b; e = e.parentElement) {
+    const p = getComputedStyle(e).position;
+    if (p === 'fixed' || p === 'sticky') { const r = e.getBoundingClientRect(); overlay = Math.max(overlay, r.width * r.height / (vw * vh)); }
+  }
+  let offender = null, far = 0;
+  for (const e of Array.from(b.querySelectorAll('*')).slice(0, 3000)) {
+    const r = e.getBoundingClientRect();
+    if (r.width > 0 && r.right > vw + 8 && r.right > far) {
+      far = r.right;
+      offender = e.tagName.toLowerCase() + (e.id ? '#' + e.id : '') +
+        (typeof e.className === 'string' && e.className.trim() ? '.' + e.className.trim().split(/\\s+/)[0] : '');
+    }
+  }
+  const linkChars = Array.from(d.querySelectorAll('a')).reduce((n, a) => n + (a.innerText || '').length, 0);
+  const h1 = d.querySelector('h1');
+  return {
+    title: (d.title || '').trim(), text: text.slice(0, 20000), textLen: text.length,
+    words: text ? text.split(/\\s+/).length : 0,
+    sheets: Array.from(d.styleSheets).filter(s => { try { return s.cssRules.length > 0; } catch (e) { return true; } }).length,
+    declared: d.querySelectorAll('link[rel~=stylesheet]').length,
+    inline: d.querySelectorAll('style').length,
+    h1Count: d.querySelectorAll('h1').length, h1Text: h1 ? (h1.innerText || '').trim().slice(0, 120) : '',
+    linkRatio: text.length ? linkChars / text.length : 0,
+    password: !!d.querySelector('input[type=password]'),
+    viewportMeta: !!d.querySelector('meta[name=viewport]'),
+    lowContrast: low, overlay: overlay, offender: offender,
+    overflow: root.scrollWidth - root.clientWidth,
+    brokenImgs: Array.from(d.images).filter(i => i.complete && i.naturalWidth === 0 && i.src).map(i => i.src.slice(0, 90)),
+    links: Array.from(d.querySelectorAll('a[href]')).slice(0, 400)
+      .map(a => ({href: a.href, nav: !!a.closest('nav,header,[role=navigation]')})),
+  };
+}"""
+
+
+def review_metrics(m, vp_name, sub, min_words):
+    """Interpreta le metriche di una pagina: ritorna [(sev, msg)]. Stile/layout su ogni viewport,
+    contenuto/semantica solo su desktop (sono identici su mobile)."""
+    out = []
+    if m["declared"] and m["sheets"] == 0:
+        out.append(("FAIL", "CSS dichiarato ma nessun foglio di stile caricato (pagina probabilmente senza stile)"))
+    elif m["declared"] == 0 and m["inline"] == 0:
+        out.append(("WARN", "pagina senza alcun CSS"))
+    if m["lowContrast"]:
+        out.append(("WARN", f"testo poco leggibile (contrasto basso): {', '.join(m['lowContrast'])}"))
+    if m["overlay"] > 0.6:
+        out.append(("WARN", f"un elemento fisso copre il {m['overlay']:.0%} della pagina (banner/modale?)"))
+    if m["overflow"] > 8 and vp_name == "mobile":
+        who = f" (es. {m['offender']})" if m["offender"] else ""
+        out.append(("WARN", f"overflow orizzontale di {m['overflow']}px{who}"))
+    if vp_name == "mobile":
+        if not m["viewportMeta"]:
+            out.append(("WARN", "meta viewport assente (layout mobile a rischio)"))
+        return out
+    if m["textLen"] < 50:
+        out.append(("FAIL", "pagina vuota nel browser"))
+        return out
+    if sub and not m["title"]:
+        out.append(("WARN", "titolo mancante"))
+    if m["title"] and re.search(GENERIC_TITLE, m["title"], re.I):
+        out.append(("WARN", f"titolo generico: {m['title']!r}"))
+    for label, val in (("titolo", m["title"]), ("h1", m["h1Text"])):
+        if val and re.search(ERROR_TITLE, val, re.I):
+            out.append(("FAIL", f"{label} indica una pagina di errore: {val[:80]!r}"))
+            break
+    if m["words"] < min_words:
+        out.append(("WARN", f"poco contenuto informativo ({m['words']} parole)"))
+    if m["h1Count"] == 0:
+        out.append(("WARN", "h1 assente"))
+    if m["linkRatio"] > 0.9 and m["words"] < 150:
+        out.append(("WARN", "contenuto composto quasi solo da link"))
+    if m["password"] and m["words"] < 100:
+        out.append(("WARN", "sembra una pagina di login, non informativa"))
+    return out
+
+
+def pick_links(cands, base, n, exclude):
+    """Sceglie fino a n link interni diversificati per sezione (primo segmento del percorso,
+    saltando un prefisso lingua tipo /en/), preferendo quelli di navigazione."""
+    if n <= 0:
+        return []
+    host = lambda u: urlparse(u).netloc.lower().removeprefix("www.")
+    base_host = host(base)
+    seen, groups = {base.split("#")[0].rstrip("/")}, {}
+    for c in sorted(cands, key=lambda c: not c.get("nav")):  # sort stabile: nav per primi
+        u = urljoin(base, c["href"]).split("#")[0]
+        p = urlparse(u)
+        if p.scheme not in ("http", "https") or host(u) != base_host:
+            continue
+        if u.rstrip("/") in seen or any(re.search(x, u, re.I) for x in exclude):
+            continue
+        seen.add(u.rstrip("/"))
+        segs = [s for s in p.path.split("/") if s]
+        if len(segs) > 1 and re.fullmatch(r"[a-z]{2}(-[a-z]{2})?", segs[0], re.I):
+            segs = segs[1:]
+        groups.setdefault(segs[0] if segs else "", []).append(u)
+    out = []
+    while len(out) < n and any(groups.values()):
+        for k in list(groups):
+            if groups[k] and len(out) < n:
+                out.append(groups[k].pop(0))
+    return out
+
+
+def _slug(s):
+    return re.sub(r"[^a-z0-9]+", "_", s.lower()).strip("_")
+
+
+async def analyze_page(browser, sem, res, url, vp_name, vp, args, sub, shots_dir):
+    """Apre `url` nel browser con il viewport dato e registra i problemi su `res`.
+    Ritorna i link candidati della pagina (usati per l'esplorazione)."""
+    p = urlparse(url)
+    where = f"[{vp_name}] " + (f"{(p.path or '/')}{'?' + p.query if p.query else ''}: " if sub else "")
+    async with sem:
+        log.info("browser: carico %s [%s]", url, vp_name)
+        ctx = await browser.new_context(viewport=vp, user_agent=UA, ignore_https_errors=False,
+                                        is_mobile=(vp_name == "mobile"))
+        page = await ctx.new_page()
+        errs, failed, bad = [], [], []
+        page.on("console", lambda m: errs.append(m.text) if m.type == "error" else None)
+        page.on("pageerror", lambda e: errs.append(str(e)))
+        page.on("requestfailed", lambda rq: failed.append(f"{rq.url[:90]} ({rq.failure})"))
+        # la risposta del documento principale e' gia' valutata (status), qui solo le sottorisorse
+        page.on("response", lambda rp: bad.append(f"{rp.status} {rp.url[:90]}")
+                if rp.status >= 400 and not rp.request.is_navigation_request() else None)
+        try:
+            resp = await page.goto(url, wait_until="load", timeout=args.timeout * 1000)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=4000)
+            except Exception:
+                pass
+            if sub and resp is not None and resp.status >= 400:
+                res.add("FAIL", f"{where}HTTP {resp.status}")
+            m = await page.evaluate(PAGE_METRICS_JS)
+            log.debug("metriche %s%s: words=%s sheets=%s/%s h1=%s overlay=%.2f", where, url, m["words"],
+                      m["sheets"], m["declared"], m["h1Count"], m["overlay"])
+
+            # evita duplicati: il 404 e' gia' in `bad`, il console error generico e' rumore
+            kept = []
+            for e in errs:
+                pat = next((x for x in args.ignore_js_errors if re.search(x, e)), None)
+                if pat:
+                    log.debug("%s%s errore JS ignorato (%s): %s", where, url, pat, e[:150])
+                else:
+                    kept.append(e)
+            bad_urls = {b.split(" ", 1)[1] for b in bad}
+            failed = [f for f in failed if f.split(" (")[0] not in bad_urls]
+            for e in kept[:3]:
+                res.add("WARN", f"{where}errore JS: {e[:110]}")
+            for f in failed[:3]:
+                res.add("WARN", f"{where}richiesta fallita: {f}")
+            for b in bad[:3]:
+                res.add("WARN", f"{where}risorsa {b}")
+            for b in m["brokenImgs"][:3]:
+                res.add("WARN", f"{where}immagine non renderizzata: {b}")
+
+            for sev, msg in review_metrics(m, vp_name, sub, args.min_words):
+                res.add(sev, f"{where}{msg}")
+            if sub and vp_name == "desktop":  # sulle pagine esplorate cerca anche le pagine di errore "soft"
+                for pat, sev, msg in SOFT_ERRORS:
+                    if re.search(pat, m["text"], re.I | re.M):
+                        res.add(sev, f"{where}{msg}")
+
+            host = _slug(p.netloc or url)
+            shot = shots_dir / f"{host}__{_slug(p.path + p.query) if sub else 'home'}_{vp_name}.png"
+            await page.screenshot(path=str(shot))
+            res.screenshots.append(str(shot))
+            return m["links"]
+        except Exception as e:
+            log.exception("browser: %s [%s] fallito", url, vp_name)
+            res.add("FAIL", f"{where}caricamento fallito: {type(e).__name__}")
+            return []
+        finally:
+            await ctx.close()
+
+
+async def browse_site(browser, sem, res, args, shots_dir, viewports):
+    if res.status == 0 or res.status >= 500:
+        log.info("browser: salto %s (status %s)", res.url, res.status)
+        return
+    main = res.final_url or res.url
+    links = await analyze_page(browser, sem, res, main, "desktop", viewports["desktop"], args, False, shots_dir)
+    res.explored = pick_links(links, main, args.explore_pages, args.explore_exclude)
+    log.info("esplorazione %s: %d pagine %s", res.url, len(res.explored), res.explored)
+    jobs = [analyze_page(browser, sem, res, main, "mobile", viewports["mobile"], args, False, shots_dir)]
+    jobs += [analyze_page(browser, sem, res, u, n, v, args, True, shots_dir)
+             for u in res.explored for n, v in viewports.items()]
+    await asyncio.gather(*jobs)
+
+
 async def check_browser(results, args):
     try:
         from playwright.async_api import async_playwright
@@ -276,66 +506,7 @@ async def check_browser(results, args):
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch()
-
-        async def one(res, vp_name, vp):
-            if res.status == 0 or res.status >= 500:
-                log.info("browser: salto %s [%s] (status %s)", res.url, vp_name, res.status)
-                return
-            async with sem:
-                log.info("browser: carico %s [%s]", res.url, vp_name)
-                ctx = await browser.new_context(viewport=vp, user_agent=UA, ignore_https_errors=False,
-                                                is_mobile=(vp_name == "mobile"))
-                page = await ctx.new_page()
-                errs, failed, bad = [], [], []
-                page.on("console", lambda m: errs.append(m.text) if m.type == "error" else None)
-                page.on("pageerror", lambda e: errs.append(str(e)))
-                page.on("requestfailed", lambda rq: failed.append(f"{rq.url[:90]} ({rq.failure})"))
-                page.on("response", lambda rp: bad.append(f"{rp.status} {rp.url[:90]}") if rp.status >= 400 else None)
-                tag = f"[{vp_name}] "
-                try:
-                    await page.goto(res.final_url or res.url, wait_until="load", timeout=args.timeout * 1000)
-                    try:
-                        await page.wait_for_load_state("networkidle", timeout=4000)
-                    except Exception:
-                        pass
-                    broken = await page.evaluate(
-                        "Array.from(document.images).filter(i=>i.complete&&i.naturalWidth===0&&i.src).map(i=>i.src.slice(0,90))")
-                    overflow = await page.evaluate(
-                        "document.documentElement.scrollWidth - document.documentElement.clientWidth")
-                    textlen = await page.evaluate("(document.body.innerText||'').trim().length")
-                    # evita duplicati: il 404 e' gia' in `bad`, il console error generico e' rumore
-                    kept = []
-                    for e in errs:
-                        pat = next((p for p in args.ignore_js_errors if re.search(p, e)), None)
-                        if pat:
-                            log.debug("%s%s errore JS ignorato (%s): %s", tag, res.url, pat, e[:150])
-                        else:
-                            kept.append(e)
-                    errs = kept
-                    bad_urls = {b.split(" ", 1)[1] for b in bad}
-                    failed = [f for f in failed if f.split(" (")[0] not in bad_urls]
-                    for e in errs[:3]:
-                        res.add("WARN", f"{tag}errore JS: {e[:110]}")
-                    for f in failed[:3]:
-                        res.add("WARN", f"{tag}richiesta fallita: {f}")
-                    for b in bad[:3]:
-                        res.add("WARN", f"{tag}risorsa {b}")
-                    for b in broken[:3]:
-                        res.add("WARN", f"{tag}immagine non renderizzata: {b}")
-                    if vp_name == "mobile" and overflow > 8:
-                        res.add("WARN", f"{tag}overflow orizzontale di {overflow}px")
-                    if textlen < 50:
-                        res.add("FAIL", f"{tag}pagina vuota nel browser")
-                    shot = out / f"{re.sub(r'[^a-z0-9]+', '_', (urlparse(res.url).netloc or res.url).lower())}_{vp_name}.png"
-                    await page.screenshot(path=str(shot))
-                    res.screenshots.append(str(shot))
-                except Exception as e:
-                    log.exception("browser: %s [%s] fallito", res.url, vp_name)
-                    res.add("FAIL", f"{tag}caricamento fallito: {type(e).__name__}")
-                finally:
-                    await ctx.close()
-
-        await asyncio.gather(*(one(r, n, v) for r in results for n, v in viewports.items()))
+        await asyncio.gather(*(browse_site(browser, sem, r, args, out, viewports) for r in results))
         await browser.close()
 
 
@@ -346,6 +517,8 @@ def print_table(results):
         c, z = (col[r.verdict], "\033[0m") if tty else ("", "")
         tls = f" tls:{r.tls_days}g" if isinstance(r.tls_days, int) else ""
         print(f"{c}{r.verdict:4}{z} {r.status or '---':>3} {r.ms:>5}ms{tls}  {r.url}")
+        if r.explored:
+            print(f"        esplorate {len(r.explored)} pagine: " + ", ".join(u.split(urlparse(u).netloc, 1)[-1] or "/" for u in r.explored))
         for sev, msg in r.issues:
             print(f"        {sev:4} {msg}")
     n = {v: sum(1 for r in results if r.verdict == v) for v in ("OK", "WARN", "FAIL")}
@@ -357,7 +530,7 @@ def write_html(results, path):
     rows = []
     for r in results:
         iss = "<br>".join(f"<b>{s}</b> {escape(m)}" for s, m in r.issues) or "-"
-        shots = " ".join(f'<a href="{escape(s)}">{Path(s).stem.split("_")[-1]}</a>' for s in r.screenshots)
+        shots = " ".join(f'<a href="{escape(s)}">{escape(Path(s).stem.split("__", 1)[-1])}</a>' for s in r.screenshots)
         rows.append(
             f'<tr style="background:{colors[r.verdict]}"><td>{r.verdict}</td>'
             f'<td><a href="{escape(r.url)}">{escape(r.url)}</a><br><small>{escape(r.title)}</small></td>'
@@ -421,7 +594,7 @@ def load_config(path):
     if unknown:
         sys.exit(f"{p}: chiavi sconosciute: {', '.join(unknown)} (valide: {', '.join(DEFAULTS)})")
     cfg = {**DEFAULTS, **data}
-    for k in ("urls", "ignore_js_errors"):
+    for k in ("urls", "ignore_js_errors", "explore_exclude"):
         if not isinstance(cfg[k], list):
             sys.exit(f"{p}: `{k}` deve essere una lista")
     return argparse.Namespace(**cfg)

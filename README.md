@@ -21,6 +21,12 @@ Il tool è uno script singolo ([sitechecker.py](sitechecker.py)), configurato tr
 - immagini non renderizzate, overflow orizzontale su mobile, pagina visivamente vuota
 - salva uno screenshot per ogni viewport
 
+**Esplorazione e giudizio sulle pagine (con `browser: true`)**
+- oltre alla pagina indicata visita fino a `explore_pages` pagine interne, scelte tra **sezioni diverse** del sito (si preferiscono i link di navigazione; si saltano PDF, download e logout)
+- stile e layout (desktop e mobile): CSS dichiarato ma non caricato (pagina "spaginata"), pagina senza alcun CSS, testo con contrasto illeggibile, elemento fisso che copre la pagina (banner cookie o modale), overflow orizzontale con indicazione dell'elemento responsabile, meta viewport assente
+- contenuto (desktop): titolo mancante o generico, titolo o `h1` che indicano un errore ("404", "not found", "accesso negato"…), `h1` assente, poco contenuto, pagina fatta quasi solo di link, pagina di login al posto di un contenuto
+- sulle pagine esplorate anche HTTP ≥ 400 e le pagine di errore "soft" (stack trace, Tomcat, gateway…)
+
 ## Installazione
 
 Serve Python 3.10 o superiore (testato con 3.14).
@@ -62,6 +68,9 @@ python sitechecker.py -c .config.local.yaml   # usa un file locale
 | `insecure` | `false` | ignora gli errori TLS (sconsigliato) |
 | `concurrency` | `10` | siti controllati in parallelo |
 | `browser_concurrency` | `3` | pagine aperte in parallelo nel browser |
+| `explore_pages` | `3` | pagine interne da visitare nel browser oltre alla prima (`0` = solo la prima) |
+| `explore_exclude` | logout, PDF e altri file | regex dei link da non visitare |
+| `min_words` | `40` | sotto questa soglia la pagina è "poco informativa" (WARN) |
 | `shots` | `screenshots` | cartella degli screenshot |
 | `html` / `json` | – | percorso dei report |
 | `verbose` | `0` | log su stderr: `1` = passi principali, `2` = dettaglio |
@@ -89,6 +98,8 @@ log_file: sitecheck.log
 - **Cosa è FAIL e cosa WARN.** Sono FAIL: sito non raggiungibile, timeout, HTTP ≥ 400, certificato scaduto o non valido, redirect che scende a HTTP, pagina vuota, stack trace o pagine di errore visibili, CSS/JS rotti, link interni rotti. Sono WARN: lentezza, titolo mancante, immagini rotte, mixed content, errori JS, overflow su mobile, testo placeholder.
 - **Testo visibile.** I controlli sulle pagine di errore "soft" lavorano sul testo realmente visibile: script, stili e `noscript` vengono scartati prima dell'analisi.
 - **Browser.** Le pagine con status assente o ≥ 500 non vengono aperte nel browser. Il tool aspetta il caricamento e poi, per al più 4 secondi, che la rete si quieti.
+- **Esplorazione.** I link candidati vengono letti dalla prima pagina (desktop), filtrati (stesso dominio, niente file, niente `explore_exclude`) e scelti a rotazione tra sezioni diverse, usando come sezione il primo segmento del percorso (un prefisso lingua come `/en/` viene saltato). Ogni pagina esplorata è aperta sia su desktop sia su mobile. Gli avvisi sulle pagine esplorate riportano il percorso, per esempio `[desktop] /prodotti/: …`.
+- **Euristiche, non verità assolute.** I controlli su stile e contenuto sono segnali: un WARN dice "controlla questa pagina", non che sia rotta. Il contrasto non viene valutato dove c'è un'immagine di sfondo, e i controlli di contenuto girano solo su desktop perché su mobile sono identici.
 - **Errori JS ignorati.** Alcuni errori sono rumore noto, per esempio `requestStorageAccess: Permission denied`, lanciato da widget di terze parti in Chromium headless e non visibile a un utente reale. Quelli che corrispondono a `ignore_js_errors` non entrano nel report ma restano nel log a `verbose: 2`. Per ignorarne altri basta aggiungere una regex alla lista.
 - **Log.** Con `verbose: 2` o `log_file` si vede cosa succede passo per passo: richieste, redirect e tempi, ogni problema rilevato e ogni errore ignorato con il pattern che lo ha scartato. In caso di fallimento del browser viene registrato il traceback completo.
 - **Concorrenza.** Un valore alto di `concurrency` può generare falsi FAIL (`ReadError`, connessioni rifiutate) su server fragili: in caso di errori di rete sporadici prova ad abbassarlo.
@@ -98,3 +109,4 @@ log_file: sitecheck.log
 - Non c'è nessun retry: un errore di rete transitorio produce subito un FAIL.
 - Gli errori TLS di validazione (certificato scaduto, host non corrispondente, self-signed) vengono segnalati come "non raggiungibile" con un messaggio generico, perché la connessione fallisce prima del controllo dedicato al certificato.
 - Per i contenuti non HTML (per esempio JSON) il browser segnala anche "pagina vuota", oltre all'avviso sul content-type.
+- Non c'è ancora una verifica dei link con segnaposto non risolti (per esempio `???label.xyz???`), che oggi emergono solo se si finisce per visitare quella pagina.

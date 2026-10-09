@@ -21,6 +21,13 @@ slow_ms: 3000         # oltre questa soglia la pagina e' "lenta"
 tls_warn_days: 21     # avviso se il certificato scade entro N giorni
 insecure: false       # ignora errori TLS (sconsigliato)
 
+# Esplorazione e giudizio sulle pagine (solo con browser: true)
+explore_pages: 3      # pagine interne da visitare oltre alla prima, scelte tra sezioni diverse (0 = solo la prima)
+explore_exclude:      # link da non visitare (regex)
+  - 'logout|signout|esci\b'
+  - '\.(pdf|zip|docx?|xlsx?|pptx?|jpe?g|png|gif|svg|mp[34])(\?|$)'
+min_words: 40         # sotto questa soglia la pagina e' "poco informativa" (WARN)
+
 # Parallelismo
 concurrency: 10
 browser_concurrency: 3
