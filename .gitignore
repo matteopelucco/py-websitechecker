@@ -221,3 +221,5 @@ __marimo__/
 
 # Configurazione locale (non versionata)
 .config.local.yaml
+
+screenshots/
