@@ -3,7 +3,12 @@
 #   python sitechecker.py -c .config.local.yaml
 # Le chiavi omesse assumono il valore di default indicato qui.
 
-# Siti da controllare (lo schema https:// e' opzionale)
+# Siti da controllare (lo schema https:// e' opzionale).
+# Ogni voce e' un URL oppure una mappa con controlli specifici del sito:
+#   - url: https://www.example.com
+#     expect_host: example.com        # host finale atteso dopo i redirect (www. ignorato)
+#     expect_text: ["Contatti"]       # testi che devono comparire (senza maiuscole); FAIL se assenti
+#     forbid_text: ["Welcome to nginx", "Account suspended"]   # testi che non devono comparire
 urls:
   - https://www.matteopelucco.com
 
@@ -17,6 +22,9 @@ browser: false
 links: 10             # link interni da campionare (0 = nessuno)
 max_resources: 40     # risorse (img/css/js) da verificare per pagina
 timeout: 15           # secondi
+retries: 2            # ritentativi sugli errori di rete transitori (non su timeout ed errori HTTP)
+retry_wait: 1.0       # secondi di attesa tra i tentativi
+samples: 3            # misure del tempo di risposta: si usa la mediana
 slow_ms: 3000         # oltre questa soglia la pagina e' "lenta"
 tls_warn_days: 21     # avviso se il certificato scade entro N giorni
 insecure: false       # ignora errori TLS (sconsigliato)
@@ -45,3 +53,19 @@ log_file: null        # es. sitecheck.log (log completo, livello DEBUG)
 ignore_js_errors:
   - '^Failed to load resource'
   - 'requestStorageAccess'
+
+# Richieste fallite del browser da ignorare (regex su "url (motivo)"): beacon di analytics interrotti alla chiusura pagina
+ignore_failed_requests:
+  - 'google-analytics\.com'
+  - 'googletagmanager\.com'
+  - 'doubleclick\.net'
+  - 'facebook\.com/tr'
+
+# Monitoraggio continuo (tutto opzionale)
+interval: 0           # secondi tra un giro e l'altro: > 0 = resta in esecuzione e ripete i controlli fino a Ctrl+C (0 = una volta)
+history: null         # es. history.jsonl: storico delle esecuzioni; stampa i cambi di stato e i peggioramenti dei tempi
+history_keep: 30      # esecuzioni conservate
+confirm_wait: 0       # secondi; se > 0 i siti in FAIL vengono ricontrollati dopo l'attesa (esclude i FAIL transitori)
+notify_webhook: null  # webhook Slack/Teams/compatibile (POST {"text": ...})
+notify_on: change     # change = solo cambi di stato che coinvolgono un FAIL (richiede `history`); fail = a ogni FAIL
+heartbeat_url: null   # GET a fine esecuzione (es. healthchecks.io): se non arriva, e' il monitor a non girare

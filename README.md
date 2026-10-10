@@ -40,6 +40,18 @@ pip install -r requirements.txt
 playwright install chromium
 ```
 
+Su Windows (PowerShell) i comandi cambiano: `python3` e `source` non esistono.
+
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+playwright install chromium   # solo se userai browser: true
+```
+
+Se PowerShell blocca lo script di attivazione, esegui una volta
+`Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`.
+
 Su macOS, se il Python di sistema è troppo vecchio: `brew install python@3.14`.
 
 ## Utilizzo
@@ -57,7 +69,10 @@ python sitechecker.py -c .config.local.yaml   # usa un file locale
 
 | Chiave | Default | Significato |
 |---|---|---|
-| `urls` | `[]` | elenco di URL (lo schema `https://` è opzionale) |
+| `urls` | `[]` | URL (lo schema `https://` è opzionale) oppure mappe con controlli per sito: `url`, `expect_host`, `expect_text`, `forbid_text` (vedi [config.yaml](config.yaml)) |
+| `retries` | `2` | ritentativi sugli errori di rete transitori (non su timeout ed errori HTTP) |
+| `retry_wait` | `1.0` | secondi di attesa tra i tentativi |
+| `samples` | `3` | misure del tempo di risposta: il valore usato è la mediana |
 | `urls_file` | – | file con un URL per riga (`#` per i commenti), in aggiunta a `urls` |
 | `browser` | `false` | abilita il check con browser reale |
 | `links` | `10` | link interni da campionare (`0` = nessuno) |
@@ -76,6 +91,14 @@ python sitechecker.py -c .config.local.yaml   # usa un file locale
 | `verbose` | `0` | log su stderr: `1` = passi principali, `2` = dettaglio |
 | `log_file` | – | log completo (livello DEBUG) su file |
 | `ignore_js_errors` | vedi sotto | regex degli errori JS da ignorare |
+| `ignore_failed_requests` | analytics | regex delle richieste fallite del browser da ignorare (beacon di Google Analytics, GTM, DoubleClick, Facebook) |
+| `interval` | `0` | secondi tra un giro e l'altro: se > 0 il tool resta in esecuzione e ripete i controlli fino a Ctrl+C (`0` = una sola esecuzione) |
+| `history` | – | file JSONL con lo storico: abilita il confronto con l'esecuzione precedente |
+| `history_keep` | `30` | esecuzioni conservate nello storico |
+| `confirm_wait` | `0` | secondi di attesa prima di ricontrollare i siti in FAIL (`0` = nessun ricontrollo) |
+| `notify_webhook` | – | webhook (Slack/Teams/compatibile) a cui inviare l'avviso |
+| `notify_on` | `change` | `change`: solo cambi di stato che coinvolgono un FAIL (richiede `history`); `fail`: a ogni FAIL |
+| `heartbeat_url` | – | URL chiamato a fine esecuzione, per accorgersi che il monitor ha smesso di girare |
 
 Il file viene validato all'avvio: una chiave sconosciuta (per esempio un errore di battitura) blocca l'esecuzione con un messaggio che elenca le chiavi valide.
 
@@ -104,9 +127,32 @@ log_file: sitecheck.log
 - **Log.** Con `verbose: 2` o `log_file` si vede cosa succede passo per passo: richieste, redirect e tempi, ogni problema rilevato e ogni errore ignorato con il pattern che lo ha scartato. In caso di fallimento del browser viene registrato il traceback completo.
 - **Concorrenza.** Un valore alto di `concurrency` può generare falsi FAIL (`ReadError`, connessioni rifiutate) su server fragili: in caso di errori di rete sporadici prova ad abbassarlo.
 
+## Uso come monitor periodico
+
+Per far girare il tool a intervalli si può usare `interval: 300` (resta in esecuzione e ripete i controlli ogni 5 minuti fino a Ctrl+C) oppure lo scheduler del sistema (Utilità di pianificazione di Windows, cron, GitHub Actions) con `interval: 0`. In ogni caso conviene:
+
+```yaml
+history: history.jsonl      # confronto con l'esecuzione precedente
+confirm_wait: 30            # un FAIL va confermato dopo 30 s prima di essere considerato tale
+notify_webhook: https://hooks.slack.com/...   # avviso solo sui cambi di stato con un FAIL
+heartbeat_url: https://hc-ping.com/...        # un servizio esterno avvisa se il monitor non gira più
+```
+
+- Con `interval` l'intervallo è contato dall'inizio di ciascun giro; il file di configurazione viene riletto a ogni giro (se la modifica è sbagliata si continua con l'ultima versione valida, con un errore nel log) e un giro fallito non ferma il monitor. Gli screenshot di un giro sovrascrivono quelli del precedente. L'exit code non ha significato in questa modalità: usa avvisi e storico.
+- Con `history` ogni esecuzione aggiunge una riga al file; il tool stampa i siti che sono peggiorati o migliorati e quelli il cui tempo supera di oltre il doppio (e di almeno 500 ms) la mediana storica, quando ci sono almeno 3 esecuzioni precedenti.
+- L'avviso con `notify_on: change` parte quando un sito passa a FAIL o esce da FAIL, quindi un sito rimasto giù non viene ripetuto a ogni esecuzione.
+- Il webhook riceve `{"text": "..."}`, compatibile con Slack e con i webhook entranti generici.
+
+## Test
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+Coprono le funzioni pure (`review_metrics`, `pick_links`, diagnosi TLS, storico) e i controlli HTTP contro un server locale che simula i difetti.
+
 ## Limiti noti
 
-- Non c'è nessun retry: un errore di rete transitorio produce subito un FAIL.
-- Gli errori TLS di validazione (certificato scaduto, host non corrispondente, self-signed) vengono segnalati come "non raggiungibile" con un messaggio generico, perché la connessione fallisce prima del controllo dedicato al certificato.
+- `expect_text` e `forbid_text` guardano la sola pagina principale (con `browser: true` il testo renderizzato, altrimenti il testo visibile dell'HTML).
 - Per i contenuti non HTML (per esempio JSON) il browser segnala anche "pagina vuota", oltre all'avviso sul content-type.
 - Non c'è ancora una verifica dei link con segnaposto non risolti (per esempio `???label.xyz???`), che oggi emergono solo se si finisce per visitare quella pagina.

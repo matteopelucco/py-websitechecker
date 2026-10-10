@@ -29,6 +29,7 @@ import logging
 import re
 import socket
 import ssl
+import statistics
 import sys
 import time
 from dataclasses import dataclass, field, asdict
@@ -47,12 +48,15 @@ log = logging.getLogger("sitecheck")
 
 # valori di default; ogni chiave puo' essere sovrascritta dal file di configurazione
 DEFAULTS = {
-    "urls": [],               # elenco di URL (lo schema https:// e' opzionale)
+    "urls": [],               # URL (https:// opzionale) oppure mappe {url, expect_text, forbid_text, expect_host}
     "urls_file": None,        # file con un URL per riga (# per commenti), in aggiunta a `urls`
     "browser": False,         # check con browser reale (Playwright)
     "links": 10,              # link interni da campionare (0 = nessuno)
     "max_resources": 40,
     "timeout": 15,
+    "retries": 2,             # ritentativi sugli errori di rete transitori (non su timeout ed errori HTTP)
+    "retry_wait": 1.0,        # secondi di attesa tra un tentativo e il successivo
+    "samples": 3,             # misure del tempo di risposta: si usa la mediana
     "slow_ms": 3000,
     "tls_warn_days": 21,
     "concurrency": 10,
@@ -68,6 +72,16 @@ DEFAULTS = {
     "log_file": None,         # log completo (DEBUG) su file
     # errori JS del browser noti come innocui (rumore di terze parti / limiti dell'headless); regex
     "ignore_js_errors": [r"^Failed to load resource", r"requestStorageAccess"],
+    # richieste fallite del browser da ignorare (regex su "url (motivo)"): beacon di analytics interrotti alla chiusura pagina
+    "ignore_failed_requests": [r"google-analytics\.com", r"googletagmanager\.com", r"doubleclick\.net",
+                               r"facebook\.com/tr"],
+    "interval": 0,            # secondi tra un giro e l'altro: > 0 = resta in esecuzione e ripete i controlli (0 = una volta)
+    "history": None,         # file JSONL con lo storico delle esecuzioni (abilita il confronto con la precedente)
+    "history_keep": 30,       # esecuzioni conservate nello storico
+    "confirm_wait": 0,        # secondi: se > 0 i siti in FAIL vengono ricontrollati dopo l'attesa (0 = no)
+    "notify_webhook": None,   # URL di un webhook (Slack/Teams/compatibile: POST {"text": ...})
+    "notify_on": "change",    # "change" = solo cambi di stato che coinvolgono un FAIL; "fail" = a ogni FAIL
+    "heartbeat_url": None,    # URL chiamato (GET) a fine esecuzione: serve a segnalare che il monitor non gira piu'
 }
 
 # (regex, severita', messaggio) applicati al testo VISIBILE della pagina
@@ -87,6 +101,7 @@ SOFT_ERRORS = [
 @dataclass
 class Result:
     url: str
+    site: dict = field(default_factory=dict)  # controlli specifici del sito (expect_text, ...)
     final_url: str = ""
     status: int = 0
     ms: int = 0
@@ -157,47 +172,130 @@ def tls_days_left(host, port=443, timeout=5):
         return None
 
 
-async def probe(client, url, method="HEAD"):
-    try:
-        r = await client.request(method, url)
-        if method == "HEAD" and r.status_code in (403, 405, 501):
-            r = await client.get(url)
-        return r.status_code
-    except Exception as e:
-        return type(e).__name__
+# errori di rete che spesso sono transitori: gli unici ritentati (mai timeout ed errori HTTP)
+RETRYABLE = (httpx.ConnectError, httpx.ReadError, httpx.WriteError, httpx.RemoteProtocolError)
 
 
-async def check_http(client, url, args, sem):
-    res = Result(url=url)
-    async with sem:
+def tls_error(exc):
+    """Se dietro l'eccezione c'e' un errore TLS ritorna una descrizione leggibile, altrimenti None."""
+    e = exc
+    for _ in range(8):  # catena __cause__/__context__
+        if e is None:
+            break
+        if isinstance(e, ssl.SSLCertVerificationError):
+            vm = (e.verify_message or str(e)).lower()
+            if "expired" in vm:
+                return "certificato scaduto"
+            if "hostname" in vm or "doesn't match" in vm or "ip address mismatch" in vm:
+                return "il certificato non corrisponde al nome del sito (host non corrispondente)"
+            if "in certificate chain" in vm:
+                return "radice della catena non attendibile (self-signed nella catena)"
+            if "self-signed" in vm or "self signed" in vm:
+                return "certificato self-signed (non attendibile)"
+            if "local issuer" in vm or "first certificate" in vm:
+                return "catena di certificati non attendibile (CA sconosciuta o intermedia mancante)"
+            return f"certificato non valido ({e.verify_message or e})"
+        if isinstance(e, ssl.SSLError):
+            return f"errore TLS ({e.reason or e})"
+        e = e.__cause__ or e.__context__
+    return None
+
+
+async def probe(client, url, method="HEAD", retries=0, wait=1.0):
+    """Ritorna lo status code oppure il nome dell'eccezione. Ritenta solo gli errori di rete transitori."""
+    for attempt in range(retries + 1):
+        try:
+            r = await client.request(method, url)
+            if method == "HEAD" and r.status_code in (403, 405, 501):
+                r = await client.get(url)
+            return r.status_code
+        except RETRYABLE as e:
+            if attempt < retries and not tls_error(e):
+                log.debug("probe %s: %s, ritento", url, type(e).__name__)
+                await asyncio.sleep(wait)
+                continue
+            return type(e).__name__
+        except Exception as e:
+            return type(e).__name__
+
+
+def add_probe_issue(res, label, code, url, sev):
+    # 429 e' rate limiting del server: non dice che la risorsa sia rotta
+    if code == 429:
+        res.add("WARN", f"{label}: non verificabile (429, rate limiting): {url[:90]}")
+    else:
+        res.add(sev, f"{label} ({code}): {url[:90]}")
+
+
+async def get_timed(client, url, args):
+    """GET con retry sugli errori di rete transitori. Ritorna (risposta, millisecondi dell'ultimo tentativo)."""
+    for attempt in range(args.retries + 1):
         t0 = time.monotonic()
-        log.info("HTTP GET %s", url)
         try:
             r = await client.get(url)
-        except httpx.ConnectError as e:
-            res.add("FAIL", f"non raggiungibile ({e})")
-            return res
+            return r, int((time.monotonic() - t0) * 1000)
+        except RETRYABLE as e:
+            if attempt == args.retries or tls_error(e):
+                raise
+            log.info("%s: %s (tentativo %d/%d), ritento", url, type(e).__name__, attempt + 1, args.retries + 1)
+            await asyncio.sleep(args.retry_wait)
+
+
+def check_expectations(res, text, where=""):
+    """Controlli specifici del sito sul testo della pagina: expect_text e forbid_text (senza maiuscole)."""
+    low = text.lower()
+    for s in res.site.get("expect_text", []):
+        if s.lower() not in low:
+            res.add("FAIL", f"{where}testo atteso assente: {s!r}")
+    for s in res.site.get("forbid_text", []):
+        if s.lower() in low:
+            res.add("FAIL", f"{where}testo vietato presente: {s!r}")
+
+
+async def check_http(client, site, args, sem):
+    url = site["url"]
+    res = Result(url=url, site=site)
+    async with sem:
+        log.info("HTTP GET %s", url)
+        try:
+            r, ms = await get_timed(client, url, args)
         except httpx.TimeoutException:
             res.add("FAIL", f"timeout oltre {args.timeout}s")
             return res
         except Exception as e:
-            res.add("FAIL", f"errore {type(e).__name__}: {e}")
+            tls = tls_error(e)
+            if tls:
+                res.add("FAIL", f"TLS: {tls}")
+            elif isinstance(e, httpx.ConnectError):
+                res.add("FAIL", f"non raggiungibile ({e or type(e).__name__})")
+            else:
+                res.add("FAIL", f"errore {type(e).__name__}: {e}")
             return res
-        res.ms = int((time.monotonic() - t0) * 1000)
+        times = [ms]
+        for _ in range(max(args.samples, 1) - 1):  # misure aggiuntive: un picco isolato non fa dire "lento"
+            try:
+                times.append((await get_timed(client, url, args))[1])
+            except Exception as e:
+                log.debug("%s: misura aggiuntiva fallita (%s)", url, type(e).__name__)
+        res.ms = int(statistics.median(times))
         res.status = r.status_code
         res.final_url = str(r.url)
-        log.debug("%s -> %s status=%s ms=%s redirect=%d", url, res.final_url, res.status, res.ms, len(r.history))
+        log.debug("%s -> %s status=%s ms=%s (misure %s) redirect=%d", url, res.final_url, res.status, res.ms,
+                  times, len(r.history))
 
         if len(r.history) > 5:
             res.add("WARN", f"{len(r.history)} redirect consecutivi")
         if r.status_code >= 400:
             res.add("FAIL", f"HTTP {r.status_code}")
         if res.ms > args.slow_ms:
-            res.add("WARN", f"lento: {res.ms} ms")
+            res.add("WARN", f"lento: {res.ms} ms" + (f" (mediana di {len(times)} misure: {times})" if len(times) > 1 else ""))
         if url.startswith("https") and not str(r.url).startswith("https"):
             res.add("FAIL", "il redirect finale scende a HTTP")
 
         host = urlparse(str(r.url)).hostname
+        want = res.site.get("expect_host")
+        if want and (host or "").removeprefix("www.") != want.lower().removeprefix("www."):
+            res.add("FAIL", f"il sito risponde da {host}, atteso {want}")
         if str(r.url).startswith("https") and host:
             d = await asyncio.to_thread(tls_days_left, host)
             res.tls_days = d
@@ -228,6 +326,8 @@ async def check_http(client, url, args, sem):
         for pat, sev, msg in SOFT_ERRORS:
             if re.search(pat, visible, re.I | re.M):
                 res.add(sev, msg)
+        if not args.browser:  # con il browser il testo atteso si cerca nella pagina renderizzata (siti JS)
+            check_expectations(res, visible)
 
         # risorse
         base = str(r.url)
@@ -243,10 +343,10 @@ async def check_http(client, url, args, sem):
                 res.add("WARN", f"mixed content: {absu[:90]}")
             targets.append((kind, absu))
         targets = targets[: args.max_resources]
-        codes = await asyncio.gather(*(probe(client, u) for _, u in targets))
+        codes = await asyncio.gather(*(probe(client, u, "HEAD", args.retries, args.retry_wait) for _, u in targets))
         for (kind, u), c in zip(targets, codes):
             if not (isinstance(c, int) and c < 400):
-                res.add("FAIL" if kind in ("css", "script") else "WARN", f"{kind} rotto ({c}): {u[:90]}")
+                add_probe_issue(res, f"{kind} rotto", c, u, "FAIL" if kind in ("css", "script") else "WARN")
 
         # campione link interni
         host0 = urlparse(base).netloc
@@ -261,10 +361,10 @@ async def check_http(client, url, args, sem):
         links = links[: args.links]
         if not links and args.links:
             res.add("WARN", "nessun link interno trovato")
-        codes = await asyncio.gather(*(probe(client, u, "GET") for u in links))
+        codes = await asyncio.gather(*(probe(client, u, "GET", args.retries, args.retry_wait) for u in links))
         for u, c in zip(links, codes):
             if not (isinstance(c, int) and c < 400):
-                res.add("FAIL", f"link interno rotto ({c}): {u[:90]}")
+                add_probe_issue(res, "link interno rotto", c, u, "FAIL")
     return res
 
 
@@ -448,6 +548,14 @@ async def analyze_page(browser, sem, res, url, vp_name, vp, args, sub, shots_dir
                     log.debug("%s%s errore JS ignorato (%s): %s", where, url, pat, e[:150])
                 else:
                     kept.append(e)
+            kept_f = []
+            for f in failed:
+                pat = next((x for x in args.ignore_failed_requests if re.search(x, f)), None)
+                if pat:
+                    log.debug("%s%s richiesta fallita ignorata (%s): %s", where, url, pat, f[:150])
+                else:
+                    kept_f.append(f)
+            failed = kept_f
             bad_urls = {b.split(" ", 1)[1] for b in bad}
             failed = [f for f in failed if f.split(" (")[0] not in bad_urls]
             for e in kept[:3]:
@@ -461,6 +569,8 @@ async def analyze_page(browser, sem, res, url, vp_name, vp, args, sub, shots_dir
 
             for sev, msg in review_metrics(m, vp_name, sub, args.min_words):
                 res.add(sev, f"{where}{msg}")
+            if not sub and vp_name == "desktop" and args.browser:
+                check_expectations(res, m["text"])
             if sub and vp_name == "desktop":  # sulle pagine esplorate cerca anche le pagine di errore "soft"
                 for pat, sev, msg in SOFT_ERRORS:
                     if re.search(pat, m["text"], re.I | re.M):
@@ -525,6 +635,93 @@ def print_table(results):
     print(f"\nTotale {len(results)}: OK {n['OK']}  WARN {n['WARN']}  FAIL {n['FAIL']}")
 
 
+SEV_ORDER = {"OK": 0, "WARN": 1, "FAIL": 2}
+
+
+def snapshot(results):
+    return {r.url: {"verdict": r.verdict, "status": r.status, "ms": r.ms,
+                    "issues": [f"{s} {m}" for s, m in r.issues]} for r in results}
+
+
+def read_history(path, n):
+    p = Path(path)
+    if not p.is_file():
+        return []
+    runs = []
+    for line in p.read_text(encoding="utf-8").splitlines()[-n:]:
+        try:
+            runs.append(json.loads(line))
+        except ValueError:
+            log.warning("storico %s: riga non valida ignorata", p)
+    return runs
+
+
+def append_history(path, results, keep):
+    p = Path(path)
+    lines = p.read_text(encoding="utf-8").splitlines() if p.is_file() else []
+    lines.append(json.dumps({"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                             "sites": snapshot(results)}, ensure_ascii=False))
+    p.write_text("\n".join(lines[-keep:]) + "\n", encoding="utf-8")
+
+
+def diff_runs(results, runs):
+    """Confronta i risultati con lo storico. Ritorna [{url, kind, msg, fail}]: kind e' peggiora, migliora o lento;
+    `fail` e' True se il cambio coinvolge un FAIL (e' quello che giustifica un avviso)."""
+    if not runs:
+        return []
+    out = []
+    prev = runs[-1]["sites"]
+    for r in results:
+        p = prev.get(r.url)
+        if not p:
+            continue
+        if SEV_ORDER[r.verdict] != SEV_ORDER[p["verdict"]]:
+            worse = SEV_ORDER[r.verdict] > SEV_ORDER[p["verdict"]]
+            old = set(p["issues"])
+            new = [f"{s} {m}" for s, m in r.issues if f"{s} {m}" not in old][:3] if worse else []
+            out.append({"url": r.url, "kind": "peggiora" if worse else "migliora", "fail": "FAIL" in (r.verdict, p["verdict"]),
+                        "msg": f"{r.url}: {p['verdict']} -> {r.verdict}" + "".join(f"\n      {n}" for n in new)})
+        past = [run["sites"][r.url]["ms"] for run in runs if r.url in run["sites"] and run["sites"][r.url]["ms"] > 0]
+        if len(past) >= 3 and r.ms > 0:
+            med = int(statistics.median(past))
+            if r.ms > 2 * med and r.ms - med > 500:
+                out.append({"url": r.url, "kind": "lento", "fail": False,
+                            "msg": f"{r.url}: {r.ms} ms contro una mediana storica di {med} ms"})
+    return out
+
+
+def build_alert(results, changes, mode):
+    """Testo dell'avviso, oppure None se non c'e' nulla da notificare."""
+    fails = [r for r in results if r.verdict == "FAIL"]
+    if mode == "fail":
+        if not fails:
+            return None
+        lines = [f"FAIL su {len(fails)} siti su {len(results)}:"]
+        for r in fails:
+            lines.append(f"- {r.url}: " + "; ".join(m for s, m in r.issues if s == "FAIL")[:300])
+        return "\n".join(lines)
+    relevant = [c for c in changes if c["fail"]]
+    if not relevant:
+        return None
+    return "sitecheck: cambi di stato\n" + "\n".join(f"- {c['msg']}" for c in relevant)
+
+
+async def post_text(url, text):
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            (await c.post(url, json={"text": text})).raise_for_status()
+    except Exception as e:
+        log.warning("notifica non inviata: %s", type(e).__name__)
+
+
+async def ping(url):
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            await c.get(url)
+    except Exception as e:
+        log.warning("heartbeat non inviato: %s", type(e).__name__)
+
+
 def write_html(results, path):
     colors = {"OK": "#d4edda", "WARN": "#fff3cd", "FAIL": "#f8d7da"}
     rows = []
@@ -544,39 +741,84 @@ def write_html(results, path):
     Path(path).write_text(html, encoding="utf-8")
 
 
-def load_urls(args):
-    urls = list(args.urls)
+SITE_KEYS = ("url", "expect_text", "forbid_text", "expect_host")
+
+
+def parse_site(item, where):
+    """Normalizza una voce di `urls` (stringa o mappa) in {url, expect_text: [], forbid_text: [], expect_host}."""
+    if isinstance(item, str):
+        item = {"url": item}
+    if not isinstance(item, dict) or not isinstance(item.get("url"), str):
+        sys.exit(f"{where}: ogni voce di `urls` e' un URL o una mappa con la chiave `url`")
+    unknown = sorted(set(item) - set(SITE_KEYS))
+    if unknown:
+        sys.exit(f"{where}: chiavi sconosciute per {item['url']}: {', '.join(unknown)} (valide: {', '.join(SITE_KEYS)})")
+    site = dict(item)
+    for k in ("expect_text", "forbid_text"):
+        v = site.get(k) or []
+        site[k] = [v] if isinstance(v, str) else list(v)
+    if not re.match(r"^https?://", site["url"]):
+        site["url"] = "https://" + site["url"]
+    return site
+
+
+def load_sites(args):
+    sites = [parse_site(i, "urls") for i in args.urls]
     if args.urls_file:
         for line in Path(args.urls_file).read_text(encoding="utf-8").splitlines():
             line = line.split("#")[0].strip()
             if line:
-                urls.append(line)
-    out = []
-    for u in urls:
-        if not re.match(r"^https?://", u):
-            u = "https://" + u
-        if u not in out:
-            out.append(u)
+                sites.append(parse_site(line, args.urls_file))
+    out, seen = [], set()
+    for s in sites:
+        if s["url"] not in seen:
+            seen.add(s["url"])
+            out.append(s)
     return out
 
 
 async def main_async(args):
-    urls = load_urls(args)
-    if not urls:
+    sites = load_sites(args)
+    if not sites:
         sys.exit("Nessun URL: indica `urls` o `urls_file` nel file di configurazione")
     sem = asyncio.Semaphore(args.concurrency)
     limits = httpx.Limits(max_connections=args.concurrency * 4)
     async with httpx.AsyncClient(follow_redirects=True, timeout=args.timeout, headers={"User-Agent": UA},
                                  limits=limits, verify=not args.insecure) as client:
-        results = await asyncio.gather(*(check_http(client, u, args, sem) for u in urls))
+        results = list(await asyncio.gather(*(check_http(client, s, args, sem) for s in sites)))
+        failed = [i for i, r in enumerate(results) if r.verdict == "FAIL"]
+        if args.confirm_wait > 0 and failed:
+            log.info("conferma: %d siti in FAIL, ricontrollo fra %ss", len(failed), args.confirm_wait)
+            await asyncio.sleep(args.confirm_wait)
+            again = await asyncio.gather(*(check_http(client, results[i].site, args, sem) for i in failed))
+            for i, r in zip(failed, again):
+                if r.verdict != "FAIL":
+                    log.warning("%s: FAIL transitorio al primo controllo, ok al secondo", r.url)
+                results[i] = r
     if args.browser:
         await check_browser(results, args)
     print_table(results)
+    changes = []
+    if args.history:
+        runs = read_history(args.history, args.history_keep)
+        changes = diff_runs(results, runs)
+        if changes:
+            print("\nCambiamenti rispetto all'esecuzione precedente:")
+            for c in changes:
+                print(f"  {c['kind']:8} {c['msg']}")
+        append_history(args.history, results, args.history_keep)
     if args.html:
         write_html(results, args.html)
     if args.json:
-        Path(args.json).write_text(json.dumps([{**asdict(r), "verdict": r.verdict} for r in results],
-                                              indent=2, ensure_ascii=False), encoding="utf-8")
+        Path(args.json).write_text(
+            json.dumps([{**{k: v for k, v in asdict(r).items() if k != "site"}, "verdict": r.verdict} for r in results],
+                       indent=2, ensure_ascii=False), encoding="utf-8")
+    if args.notify_webhook:
+        text = build_alert(results, changes, args.notify_on)
+        if text:
+            await post_text(args.notify_webhook, text)
+    if args.heartbeat_url:
+        await ping(args.heartbeat_url)
     return 1 if any(r.verdict == "FAIL" for r in results) else 0
 
 
@@ -594,9 +836,16 @@ def load_config(path):
     if unknown:
         sys.exit(f"{p}: chiavi sconosciute: {', '.join(unknown)} (valide: {', '.join(DEFAULTS)})")
     cfg = {**DEFAULTS, **data}
-    for k in ("urls", "ignore_js_errors", "explore_exclude"):
+    for k in ("urls", "ignore_js_errors", "ignore_failed_requests", "explore_exclude"):
         if not isinstance(cfg[k], list):
             sys.exit(f"{p}: `{k}` deve essere una lista")
+    for k in ("interval", "confirm_wait"):
+        if isinstance(cfg[k], bool) or not isinstance(cfg[k], (int, float)) or cfg[k] < 0:
+            sys.exit(f"{p}: `{k}` deve essere un numero >= 0")
+    if cfg["notify_on"] not in ("change", "fail"):
+        sys.exit(f"{p}: `notify_on` deve essere \"change\" o \"fail\"")
+    for i in cfg["urls"]:
+        parse_site(i, str(p))  # valida subito le voci
     return argparse.Namespace(**cfg)
 
 
@@ -608,7 +857,36 @@ def main():
     args = load_config(cli.config)
     setup_logging(args)
     log.info("configurazione: %s", cli.config)
-    sys.exit(asyncio.run(main_async(args)))
+    if not args.interval:
+        sys.exit(asyncio.run(main_async(args)))
+    run_forever(cli.config, args)
+
+
+def run_forever(config_path, args):
+    """Esegue il ciclo di controlli ogni `interval` secondi (contati dall'inizio di ciascun giro) fino a Ctrl+C.
+    Il config viene riletto a ogni giro: se la modifica e' sbagliata si continua con l'ultimo valido."""
+    n = 0
+    try:
+        while True:
+            n += 1
+            t0 = time.monotonic()
+            print(f"\n=== giro {n} - {datetime.now():%Y-%m-%d %H:%M:%S} (ogni {args.interval}s, Ctrl+C per fermare) ===")
+            try:
+                code = asyncio.run(main_async(args))
+                log.info("giro %d concluso, exit code %d", n, code)
+            except SystemExit as e:  # es. nessun URL: errore di configurazione, non fatale per il monitor
+                log.error("giro %d non eseguito: %s", n, e.code)
+            except Exception:
+                log.exception("giro %d fallito", n)
+            sys.stdout.flush()
+            time.sleep(max(0.0, args.interval - (time.monotonic() - t0)))
+            try:
+                args = load_config(config_path)
+            except SystemExit as e:
+                log.error("config non ricaricato, uso l'ultimo valido: %s", e.code)
+    except KeyboardInterrupt:
+        print("\nMonitor fermato.")
+        sys.exit(0)
 
 
 def setup_logging(args):

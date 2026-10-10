@@ -17,7 +17,7 @@ Per utenti finali e dettagli di configurazione vedi [README.md](README.md).
 | [requirements.txt](requirements.txt) | Dipendenze dirette (`httpx`, `PyYAML`, `playwright`) |
 | [README.md](README.md) | Documentazione per l'utente |
 
-Non ci sono ancora test automatici né una cartella `tests/`.
+[tests/test_sitechecker.py](tests/test_sitechecker.py): test `unittest` (funzioni pure + controlli HTTP contro un server locale difettoso). Non coprono il livello browser, che si prova a mano su siti reali.
 
 ## Comandi
 
@@ -28,7 +28,10 @@ playwright install chromium            # solo per browser: true
 
 python sitechecker.py                  # usa ./config.yaml
 python sitechecker.py -c .config.local.yaml
+python -m unittest discover -s tests   # prima di dichiarare finita una modifica
 ```
+
+Su Windows/PowerShell usa `python -m venv .venv` e `.venv\Scripts\Activate.ps1` (`python3` è solo un alias dello Store e `source` non esiste).
 
 Python 3.10 o superiore (il venv del progetto usa 3.14). Il Python di sistema su macOS è 3.9 e non va usato.
 
@@ -41,6 +44,8 @@ Python 3.10 o superiore (il venv del progetto usa 3.14). Il Python di sistema su
 - `PAGE_METRICS_JS` raccoglie le metriche nella pagina; `review_metrics()` le interpreta ed è una funzione pura, testabile senza browser. Le soglie e i pattern (`ERROR_TITLE`, `GENERIC_TITLE`, `min_words`) stanno lì o nei `DEFAULTS`. Le regole di stile/layout valgono per ogni viewport, quelle di contenuto solo per desktop.
 - `Result.add(sev, msg)` registra un problema (`FAIL`/`WARN`) e lo scrive nel log. Il verdetto del sito è derivato dai problemi: FAIL se ce n'è almeno uno grave, altrimenti WARN, altrimenti OK.
 - Output: `print_table`, `write_html`, e il JSON scritto in `main_async`. L'exit code è `1` solo se c'è almeno un FAIL.
+- Ciclo interno: `interval > 0` fa girare `run_forever()` (rilegge il config a ogni giro, un giro fallito non ferma il monitor; Ctrl+C esce con 0). In vista di una web app always on, la logica di un giro è tutta in `main_async()`.
+- Monitoraggio: `confirm_wait` ricontrolla i FAIL in `main_async`; `history` (JSONL) alimenta `diff_runs()` (peggiora/migliora/lento); `build_alert()` decide l'avviso per `notify_webhook`; `heartbeat_url` è un ping a fine run. `notify_on: change` senza `history` non avvisa mai.
 - Logging: logger `sitecheck`, configurato da `setup_logging` in base a `verbose` e `log_file`.
 
 ## Convenzioni
@@ -60,21 +65,25 @@ Python 3.10 o superiore (il venv del progetto usa 3.14). Il Python di sistema su
 - Un valore alto di `concurrency` produce falsi FAIL (`ReadError`, connessioni rifiutate) su server fragili, come un semplice `http.server` locale. Prima di dare la colpa allo script, riprova con una concorrenza bassa.
 - `requestStorageAccess: Permission denied` è rumore di widget di terze parti in Chromium headless, non un difetto del sito. È già in `ignore_js_errors`.
 - In zsh una variabile con più URL non viene divisa in argomenti: usa `urls` o `urls_file` nel config.
+- Le richieste di analytics interrotte (`ERR_ABORTED` sui beacon di Google Analytics) sono filtrate da `ignore_failed_requests`; se un altro tracker produce lo stesso rumore, aggiungi una regex lì.
+- Una voce di `urls` può essere una stringa o una mappa (`parse_site`); `Result.site` porta i controlli per sito e non va nel JSON.
 - Ogni sessione di test con `browser: true` crea una cartella di screenshot (default `screenshots/`). Non è nel `.gitignore`: non committarla.
 
 ## Stato e lavoro aperto
 
-Difetti noti, già verificati con test su un server locale difettoso e su host `badssl.com`, non ancora corretti:
+Risolti (oltre a quanto sotto: filtro analytics, storico, avvisi, conferma FAIL, heartbeat, `tests/`): diagnosi TLS (`tls_error`), retry sugli errori di rete (`retries`, `retry_wait`), mediana di `samples` misure, controlli per sito (`expect_text`, `forbid_text`, `expect_host` dentro `urls`). Verificati con badssl.com e con un server locale instabile (scartava le prime connessioni).
 
-1. **Errori TLS diagnosticati male.** Certificato scaduto, host non corrispondente, self-signed e catena non attendibile vengono riportati come `non raggiungibile (...)`, a volte con messaggio vuoto, perché httpx fallisce prima che parta `tls_days_left`. Da distinguere nel messaggio.
-2. **Nessun retry** sugli errori di connessione e lettura transitori: un singolo errore produce un FAIL. Proposta: 1-2 retry con breve attesa, solo per quegli errori (non per timeout o errori HTTP).
-3. Rumore minore: per i contenuti non HTML il browser segnala anche "pagina vuota"; su una 404 compare un doppione "risorsa 404"; "nessun link interno trovato" appare su ogni pagina senza link.
+Difetti noti:
 
-4. Nessuna verifica dei link con segnaposto di traduzione non risolti (per esempio `/en/???label.navigation.whoweare.link???` su cornercard.ch): emergono solo se la pagina viene esplorata.
+1. Rumore minore: per i contenuti non HTML il browser segnala anche "pagina vuota"; su una 404 compare un doppione "risorsa 404"; "nessun link interno trovato" appare su ogni pagina senza link.
+
+2. Nessuna verifica dei link con segnaposto di traduzione non risolti (per esempio `/en/???label.navigation.whoweare.link???` su cornercard.ch): emergono solo se la pagina viene esplorata.
 
 Idee non avviate:
-- Aggiungere una cartella `tests/` con un server di prova che simula i difetti (pagina vuota, stack trace, risorse rotte, errori JS, redirect in loop, timeout, 404/500, CSS non caricato, titolo di errore, banner che copre la pagina, login) e verifica i verdetti attesi. Il server usato per provare l'esplorazione non è nel repository.
-- Test unitari per `review_metrics()` e `pick_links()`, che sono funzioni pure.
+- Estendere `tests/` ai difetti ancora non simulati: errori JS e titolo di errore (richiedono il browser), login, banner che copre la pagina.
+- Regressione visiva: confrontare gli screenshot con l'ultima esecuzione buona.
+- Verifica funzionale di un flusso chiave (login di prova, ricerca, form); `expect_text` oggi guarda solo la pagina principale.
+- Altri segnali: scadenza del dominio, DNS, header di sicurezza, tempi di caricamento nel browser.
 - Giudizio di un'AI su screenshot e testo (rinviato: per ora niente Claude, e da decidere la riservatezza dei siti dei clienti).
 - Aggiungere `screenshots/` al `.gitignore`.
 
