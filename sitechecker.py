@@ -108,17 +108,39 @@ class Result:
     tls_days: int | None = None
     title: str = ""
     issues: list = field(default_factory=list)  # (sev, msg)
+    evidence: dict = field(default_factory=dict)  # indice del problema -> {page, line, html}
     screenshots: list = field(default_factory=list)
     explored: list = field(default_factory=list)  # pagine interne visitate dal browser
 
-    def add(self, sev, msg):
+    def add(self, sev, msg, page=None, line=None, html=None):
+        """Registra un problema. page/line/html dicono dove si vede: pagina, riga del sorgente, riga HTML."""
         log.debug("%s %s: %s", sev, self.url, msg)
+        ev = {k: v for k, v in (("page", page), ("line", line), ("html", html)) if v}
+        if ev:
+            self.evidence[len(self.issues)] = ev
         self.issues.append((sev, msg))
+
+    def evidence_of(self, i):
+        return self.evidence.get(i, {})
 
     @property
     def verdict(self):
         sevs = {s for s, _ in self.issues}
         return "FAIL" if "FAIL" in sevs else "WARN" if "WARN" in sevs else "OK"
+
+
+def clip(s, n=200):
+    """Riga HTML compattata su una riga e accorciata."""
+    s = " ".join((s or "").split())
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def locate(raw, pat):
+    """(numero riga, riga HTML) della prima riga del sorgente in cui scatta `pat`, oppure (None, None)."""
+    for i, line in enumerate(raw.splitlines(), 1):
+        if re.search(pat, line, re.I):
+            return i, clip(line)
+    return None, None
 
 
 class PageParser(HTMLParser):
@@ -132,18 +154,17 @@ class PageParser(HTMLParser):
 
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
+        where = (self.getpos()[0], clip(self.get_starttag_text()))
         if tag in ("script", "style", "noscript"):
             self._skip += 1
         if tag == "title":
             self._in_title = True
         if tag == "a" and a.get("href"):
-            self.links.append(a["href"])
+            self.links.append((a["href"], *where))
         elif tag in ("img", "script", "source", "iframe") and a.get("src"):
-            self.resources.append((tag, a["src"]))
+            self.resources.append((tag, a["src"], *where))
         elif tag == "link" and a.get("href") and "stylesheet" in (a.get("rel") or ""):
-            self.resources.append(("css", a["href"]))
-        if tag == "script" and a.get("src"):
-            pass
+            self.resources.append(("css", a["href"], *where))
 
     def handle_endtag(self, tag):
         if tag in ("script", "style", "noscript") and self._skip:
@@ -219,12 +240,12 @@ async def probe(client, url, method="HEAD", retries=0, wait=1.0):
             return type(e).__name__
 
 
-def add_probe_issue(res, label, code, url, sev):
+def add_probe_issue(res, label, code, url, sev, **where):
     # 429 e' rate limiting del server: non dice che la risorsa sia rotta
     if code == 429:
-        res.add("WARN", f"{label}: non verificabile (429, rate limiting): {url[:90]}")
+        res.add("WARN", f"{label}: non verificabile (429, rate limiting): {url[:90]}", **where)
     else:
-        res.add(sev, f"{label} ({code}): {url[:90]}")
+        res.add(sev, f"{label} ({code}): {url[:90]}", **where)
 
 
 async def get_timed(client, url, args):
@@ -256,7 +277,7 @@ async def check_http(client, site, args, sem):
     url = site["url"]
     res = Result(url=url, site=site)
     async with sem:
-        log.info("HTTP GET %s", url)
+        log.info("test raggiungibilita' HTTP GET %s", url)
         try:
             r, ms = await get_timed(client, url, args)
         except httpx.TimeoutException:
@@ -271,6 +292,7 @@ async def check_http(client, site, args, sem):
             else:
                 res.add("FAIL", f"errore {type(e).__name__}: {e}")
             return res
+        log.info("test status/redirect/tempi %s -> HTTP %s, %d ms", url, r.status_code, ms)
         times = [ms]
         for _ in range(max(args.samples, 1) - 1):  # misure aggiuntive: un picco isolato non fa dire "lento"
             try:
@@ -286,7 +308,7 @@ async def check_http(client, site, args, sem):
         if len(r.history) > 5:
             res.add("WARN", f"{len(r.history)} redirect consecutivi")
         if r.status_code >= 400:
-            res.add("FAIL", f"HTTP {r.status_code}")
+            res.add("FAIL", f"HTTP {r.status_code}", page=res.final_url)
         if res.ms > args.slow_ms:
             res.add("WARN", f"lento: {res.ms} ms" + (f" (mediana di {len(times)} misure: {times})" if len(times) > 1 else ""))
         if url.startswith("https") and not str(r.url).startswith("https"):
@@ -297,6 +319,7 @@ async def check_http(client, site, args, sem):
         if want and (host or "").removeprefix("www.") != want.lower().removeprefix("www."):
             res.add("FAIL", f"il sito risponde da {host}, atteso {want}")
         if str(r.url).startswith("https") and host:
+            log.info("test TLS %s", str(r.url))
             d = await asyncio.to_thread(tls_days_left, host)
             res.tls_days = d
             if isinstance(d, str):
@@ -311,6 +334,7 @@ async def check_http(client, site, args, sem):
             res.add("WARN", f"content-type inatteso: {ctype or 'assente'}")
             return res
 
+        log.info("test contenuto (titolo, testo, pagine di errore) %s", str(r.url))
         p = PageParser()
         try:
             p.feed(r.text)
@@ -322,17 +346,18 @@ async def check_http(client, site, args, sem):
         if len(visible) < 80:
             res.add("FAIL", "pagina praticamente vuota")
         if not res.title:
-            res.add("WARN", "titolo mancante")
+            res.add("WARN", "titolo mancante", page=res.final_url)
         for pat, sev, msg in SOFT_ERRORS:
             if re.search(pat, visible, re.I | re.M):
-                res.add(sev, msg)
+                line, html = locate(r.text, pat)
+                res.add(sev, msg, page=res.final_url, line=line, html=html)
         if not args.browser:  # con il browser il testo atteso si cerca nella pagina renderizzata (siti JS)
             check_expectations(res, visible)
 
         # risorse
         base = str(r.url)
         seen, targets = set(), []
-        for kind, src in p.resources:
+        for kind, src, line, html in p.resources:
             if src.startswith(("data:", "javascript:", "#")):
                 continue
             absu = urljoin(base, src)
@@ -340,31 +365,34 @@ async def check_http(client, site, args, sem):
                 continue
             seen.add(absu)
             if base.startswith("https") and absu.startswith("http://"):
-                res.add("WARN", f"mixed content: {absu[:90]}")
-            targets.append((kind, absu))
+                res.add("WARN", f"mixed content: {absu[:90]}", page=base, line=line, html=html)
+            targets.append((kind, absu, line, html))
         targets = targets[: args.max_resources]
-        codes = await asyncio.gather(*(probe(client, u, "HEAD", args.retries, args.retry_wait) for _, u in targets))
-        for (kind, u), c in zip(targets, codes):
+        log.info("test risorse %s: %d da verificare", base, len(targets))
+        codes = await asyncio.gather(*(probe(client, u, "HEAD", args.retries, args.retry_wait) for _, u, _, _ in targets))
+        for (kind, u, line, html), c in zip(targets, codes):
             if not (isinstance(c, int) and c < 400):
-                add_probe_issue(res, f"{kind} rotto", c, u, "FAIL" if kind in ("css", "script") else "WARN")
+                add_probe_issue(res, f"{kind} rotto", c, u, "FAIL" if kind in ("css", "script") else "WARN",
+                                page=base, line=line, html=html)
 
         # campione link interni
         host0 = urlparse(base).netloc
         links, seen_l = [], set()
-        for h in p.links:
+        for h, line, html in p.links:
             if h.startswith(("mailto:", "tel:", "javascript:", "#")):
                 continue
             absu = urljoin(base, h).split("#")[0]
             if urlparse(absu).netloc == host0 and absu not in seen_l and absu != base:
                 seen_l.add(absu)
-                links.append(absu)
+                links.append((absu, line, html))
         links = links[: args.links]
+        log.info("test link interni %s: %d da verificare", base, len(links))
         if not links and args.links:
             res.add("WARN", "nessun link interno trovato")
-        codes = await asyncio.gather(*(probe(client, u, "GET", args.retries, args.retry_wait) for u in links))
-        for u, c in zip(links, codes):
+        codes = await asyncio.gather(*(probe(client, u, "GET", args.retries, args.retry_wait) for u, _, _ in links))
+        for (u, line, html), c in zip(links, codes):
             if not (isinstance(c, int) and c < 400):
-                add_probe_issue(res, "link interno rotto", c, u, "FAIL")
+                add_probe_issue(res, "link interno rotto", c, u, "FAIL", page=base, line=line, html=html)
     return res
 
 
@@ -426,12 +454,15 @@ PAGE_METRICS_JS = """() => {
     declared: d.querySelectorAll('link[rel~=stylesheet]').length,
     inline: d.querySelectorAll('style').length,
     h1Count: d.querySelectorAll('h1').length, h1Text: h1 ? (h1.innerText || '').trim().slice(0, 120) : '',
+    titleHtml: d.querySelector('title') ? d.querySelector('title').outerHTML.slice(0, 200) : '',
+    h1Html: h1 ? h1.outerHTML.slice(0, 200) : '',
     linkRatio: text.length ? linkChars / text.length : 0,
     password: !!d.querySelector('input[type=password]'),
     viewportMeta: !!d.querySelector('meta[name=viewport]'),
     lowContrast: low, overlay: overlay, offender: offender,
     overflow: root.scrollWidth - root.clientWidth,
-    brokenImgs: Array.from(d.images).filter(i => i.complete && i.naturalWidth === 0 && i.src).map(i => i.src.slice(0, 90)),
+    brokenImgs: Array.from(d.images).filter(i => i.complete && i.naturalWidth === 0 && i.src)
+      .map(i => ({url: i.src.slice(0, 90), html: i.outerHTML.slice(0, 200), ref: i.getAttribute('src')})),
     links: Array.from(d.querySelectorAll('a[href]')).slice(0, 400)
       .map(a => ({href: a.href, nav: !!a.closest('nav,header,[role=navigation]')})),
   };
@@ -479,6 +510,27 @@ def review_metrics(m, vp_name, sub, min_words):
     return out
 
 
+# elementi della pagina che puntano a un URL (per mostrare la riga HTML che causa l'errore)
+FIND_REFS_JS = """urls => urls.map(u => {
+  for (const e of document.querySelectorAll('[src],[href],[data-src]')) {
+    for (const a of ['src', 'href', 'data-src']) {
+      const v = e.getAttribute(a);
+      try { if (v && new URL(v, document.baseURI).href === u) return {html: e.outerHTML.slice(0, 200), ref: v}; } catch (x) {}
+    }
+  }
+  return null;
+})"""
+
+
+def ref_line(raw, ref):
+    """Riga del sorgente (non renderizzato) in cui compare il riferimento `ref`."""
+    if raw and ref:
+        for i, line in enumerate(raw.splitlines(), 1):
+            if ref in line:
+                return i
+    return None
+
+
 def pick_links(cands, base, n, exclude):
     """Sceglie fino a n link interni diversificati per sezione (primo segmento del percorso,
     saltando un prefisso lingua tipo /en/), preferendo quelli di navigazione."""
@@ -524,9 +576,9 @@ async def analyze_page(browser, sem, res, url, vp_name, vp, args, sub, shots_dir
         errs, failed, bad = [], [], []
         page.on("console", lambda m: errs.append(m.text) if m.type == "error" else None)
         page.on("pageerror", lambda e: errs.append(str(e)))
-        page.on("requestfailed", lambda rq: failed.append(f"{rq.url[:90]} ({rq.failure})"))
+        page.on("requestfailed", lambda rq: failed.append((rq.url, rq.failure)))
         # la risposta del documento principale e' gia' valutata (status), qui solo le sottorisorse
-        page.on("response", lambda rp: bad.append(f"{rp.status} {rp.url[:90]}")
+        page.on("response", lambda rp: bad.append((rp.status, rp.url))
                 if rp.status >= 400 and not rp.request.is_navigation_request() else None)
         try:
             resp = await page.goto(url, wait_until="load", timeout=args.timeout * 1000)
@@ -535,7 +587,12 @@ async def analyze_page(browser, sem, res, url, vp_name, vp, args, sub, shots_dir
             except Exception:
                 pass
             if sub and resp is not None and resp.status >= 400:
-                res.add("FAIL", f"{where}HTTP {resp.status}")
+                res.add("FAIL", f"{where}HTTP {resp.status}", page=url)
+            try:
+                raw = await resp.text() if resp is not None else ""
+            except Exception:
+                raw = ""
+            log.info("test pagina nel browser %s%s (stile, contenuto, errori JS, risorse)", where, url)
             m = await page.evaluate(PAGE_METRICS_JS)
             log.debug("metriche %s%s: words=%s sheets=%s/%s h1=%s overlay=%.2f", where, url, m["words"],
                       m["sheets"], m["declared"], m["h1Count"], m["overlay"])
@@ -550,34 +607,45 @@ async def analyze_page(browser, sem, res, url, vp_name, vp, args, sub, shots_dir
                     kept.append(e)
             kept_f = []
             for f in failed:
-                pat = next((x for x in args.ignore_failed_requests if re.search(x, f)), None)
+                text = f"{f[0][:90]} ({f[1]})"
+                pat = next((x for x in args.ignore_failed_requests if re.search(x, text)), None)
                 if pat:
-                    log.debug("%s%s richiesta fallita ignorata (%s): %s", where, url, pat, f[:150])
+                    log.debug("%s%s richiesta fallita ignorata (%s): %s", where, url, pat, text[:150])
                 else:
                     kept_f.append(f)
-            failed = kept_f
-            bad_urls = {b.split(" ", 1)[1] for b in bad}
-            failed = [f for f in failed if f.split(" (")[0] not in bad_urls]
+            bad_urls = {u for _, u in bad}
+            failed = [f for f in kept_f if f[0] not in bad_urls][:3]
+            bad = bad[:3]
+            # per ogni risorsa in errore cerca l'elemento della pagina che la richiede
+            refs = await page.evaluate(FIND_REFS_JS, [u for _, u in bad] + [u for u, _ in failed])
+            refs = [r or {} for r in refs]
+
+            def ev(r):
+                return dict(page=url, html=r.get("html"), line=ref_line(raw, r.get("ref")))
             for e in kept[:3]:
-                res.add("WARN", f"{where}errore JS: {e[:110]}")
-            for f in failed[:3]:
-                res.add("WARN", f"{where}richiesta fallita: {f}")
-            for b in bad[:3]:
-                res.add("WARN", f"{where}risorsa {b}")
+                res.add("WARN", f"{where}errore JS: {e[:110]}", page=url)
+            for (u, why), r in zip(failed, refs[len(bad):]):
+                res.add("WARN", f"{where}richiesta fallita: {u[:90]} ({why})", **ev(r))
+            for (code, u), r in zip(bad, refs):
+                res.add("WARN", f"{where}risorsa {code} {u[:90]}", **ev(r))
             for b in m["brokenImgs"][:3]:
-                res.add("WARN", f"{where}immagine non renderizzata: {b}")
+                res.add("WARN", f"{where}immagine non renderizzata: {b['url']}",
+                        **ev({"html": b["html"], "ref": b["ref"]}))
 
             for sev, msg in review_metrics(m, vp_name, sub, args.min_words):
-                res.add(sev, f"{where}{msg}")
+                html = m["titleHtml"] if "titolo indica" in msg else m["h1Html"] if "h1 indica" in msg else None
+                res.add(sev, f"{where}{msg}", page=url, html=html)
             if not sub and vp_name == "desktop" and args.browser:
                 check_expectations(res, m["text"])
             if sub and vp_name == "desktop":  # sulle pagine esplorate cerca anche le pagine di errore "soft"
                 for pat, sev, msg in SOFT_ERRORS:
                     if re.search(pat, m["text"], re.I | re.M):
-                        res.add(sev, f"{where}{msg}")
+                        line, html = locate(raw, pat)
+                        res.add(sev, f"{where}{msg}", page=url, line=line, html=html)
 
             host = _slug(p.netloc or url)
             shot = shots_dir / f"{host}__{_slug(p.path + p.query) if sub else 'home'}_{vp_name}.png"
+            log.info("test screenshot %s%s -> %s", where, url, shot)
             await page.screenshot(path=str(shot))
             res.screenshots.append(str(shot))
             return m["links"]
@@ -611,6 +679,10 @@ async def check_browser(results, args):
         return
     out = Path(args.shots)
     out.mkdir(parents=True, exist_ok=True)
+    old = list(out.glob("*.png"))  # solo i .png: la cartella potrebbe contenere altro
+    for f in old:
+        f.unlink()
+    log.info("screenshot: cancellati %d file precedenti in %s", len(old), out)
     sem = asyncio.Semaphore(args.browser_concurrency)
     viewports = {"desktop": {"width": 1366, "height": 768}, "mobile": {"width": 390, "height": 844}}
 
@@ -629,8 +701,13 @@ def print_table(results):
         print(f"{c}{r.verdict:4}{z} {r.status or '---':>3} {r.ms:>5}ms{tls}  {r.url}")
         if r.explored:
             print(f"        esplorate {len(r.explored)} pagine: " + ", ".join(u.split(urlparse(u).netloc, 1)[-1] or "/" for u in r.explored))
-        for sev, msg in r.issues:
+        for i, (sev, msg) in enumerate(r.issues):
             print(f"        {sev:4} {msg}")
+            ev = r.evidence_of(i)
+            if ev.get("page"):
+                print(f"             in {ev['page']}" + (f", riga {ev['line']}" if ev.get("line") else ""))
+            if ev.get("html"):
+                print(f"             > {ev['html']}")
     n = {v: sum(1 for r in results if r.verdict == v) for v in ("OK", "WARN", "FAIL")}
     print(f"\nTotale {len(results)}: OK {n['OK']}  WARN {n['WARN']}  FAIL {n['FAIL']}")
 
@@ -722,11 +799,21 @@ async def ping(url):
         log.warning("heartbeat non inviato: %s", type(e).__name__)
 
 
+def html_evidence(ev):
+    out = ""
+    if ev.get("page"):
+        out += f"<br><small>in {escape(ev['page'])}" + (f", riga {ev['line']}" if ev.get("line") else "") + "</small>"
+    if ev.get("html"):
+        out += f"<br><code>{escape(ev['html'])}</code>"
+    return out
+
+
 def write_html(results, path):
     colors = {"OK": "#d4edda", "WARN": "#fff3cd", "FAIL": "#f8d7da"}
     rows = []
     for r in results:
-        iss = "<br>".join(f"<b>{s}</b> {escape(m)}" for s, m in r.issues) or "-"
+        iss = "<br>".join(f"<b>{s}</b> {escape(m)}{html_evidence(r.evidence_of(i))}"
+                          for i, (s, m) in enumerate(r.issues)) or "-"
         shots = " ".join(f'<a href="{escape(s)}">{escape(Path(s).stem.split("__", 1)[-1])}</a>' for s in r.screenshots)
         rows.append(
             f'<tr style="background:{colors[r.verdict]}"><td>{r.verdict}</td>'

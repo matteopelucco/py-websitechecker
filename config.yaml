@@ -41,7 +41,7 @@ concurrency: 10
 browser_concurrency: 3
 
 # Output
-shots: screenshots    # cartella degli screenshot (solo con browser: true)
+shots: screenshots    # cartella degli screenshot, svuotata dei .png a ogni avvio (solo con browser: true)
 html: null            # es. report.html
 json: null            # es. report.json
 

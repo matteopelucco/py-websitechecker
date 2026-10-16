@@ -4,6 +4,8 @@ Verifica rapida della salute di uno o più siti web **dal punto di vista del cli
 
 Il tool è uno script singolo ([sitechecker.py](sitechecker.py)), configurato tramite un file YAML. Produce una tabella a terminale e, se richiesto, un report HTML e/o JSON. L'exit code (`0` = tutto OK/WARN, `1` = almeno un FAIL) lo rende utilizzabile in cron e CI.
 
+Ogni problema trovato in una pagina (404 su risorse e link, pagine di errore, immagini rotte, ecc.) riporta, quando possibile, la pagina in cui compare, il numero di riga del sorgente e la riga HTML responsabile (per esempio `<img src="/nope.png">`). Si vede in tabella, nel report HTML e nel JSON (campo `evidence`).
+
 ## Cosa controlla
 
 **Livello 1 – solo HTTP (default, veloce)**
@@ -86,7 +88,7 @@ python sitechecker.py -c .config.local.yaml   # usa un file locale
 | `explore_pages` | `3` | pagine interne da visitare nel browser oltre alla prima (`0` = solo la prima) |
 | `explore_exclude` | logout, PDF e altri file | regex dei link da non visitare |
 | `min_words` | `40` | sotto questa soglia la pagina è "poco informativa" (WARN) |
-| `shots` | `screenshots` | cartella degli screenshot |
+| `shots` | `screenshots` | cartella degli screenshot; i `.png` vengono cancellati a ogni avvio |
 | `html` / `json` | – | percorso dei report |
 | `verbose` | `0` | log su stderr: `1` = passi principali, `2` = dettaglio |
 | `log_file` | – | log completo (livello DEBUG) su file |
